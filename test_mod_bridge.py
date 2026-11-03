@@ -146,7 +146,7 @@ def test_new_lua_mod_runs_combat_on_the_game_thread():
     assert "IA_YaoHuLu" in source
     assert "IA_ChangeWeapon" in source
     assert "IA_ShadowArm" in source
-    assert "target.shield > 0" in source
+    assert "ShieldOf" in source and "shadow_uses" in source
 
 
 def test_new_desktop_entrypoint_does_not_import_old_combat_runtime():

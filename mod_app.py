@@ -16,7 +16,7 @@ from ui_components import BG, BORDER, GREEN, MUTED, SURFACE, TEXT, AMBER
 from ui_components import Button, Panel, label
 from windows_io import Hotkeys, find_game_by_name, dpi_aware
 
-VERSION = '0.14.2'
+VERSION = '0.15.2'
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 DATA = ROOT / 'data-v0.10'
 GAME_DEFAULT = r'E:\Steam\steamapps\common\PBZ\platform\steam\PBZ.exe'

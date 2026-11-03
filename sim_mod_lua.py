@@ -28,8 +28,14 @@ class ClassObject:
     def __init__(self, name: str):
         self._name = name
 
+    def IsValid(self) -> bool:
+        return True
+
     def GetFName(self) -> FName:
         return FName(self._name)
+
+    def GetFullName(self) -> str:
+        return self._name
 
 
 class Tag:
@@ -163,11 +169,36 @@ class Actor:
         return f'{self._class} {self._name}'
 
 
+class BulletSource:
+    """Stands in for the object that produced a deflect frame (arrow, grenade...)."""
+
+    def __init__(self, class_name: str):
+        self._class = class_name
+
+    def IsValid(self) -> bool:
+        return True
+
+    def GetClass(self) -> ClassObject:
+        return ClassObject(self._class)
+
+    def GetFName(self) -> FName:
+        return FName(self._class)
+
+    def __getitem__(self, key):
+        return getattr(self, str(key), None)
+
+
 class Frame:
-    def __init__(self, hit: float, is_dodge=False, is_hit=False):
+    def __init__(self, hit: float, is_dodge=False, is_hit=False, source=None):
         self.HitGameTime = hit
         self.IsDodge = is_dodge
         self.IsHit = is_hit
+        if source is not None:
+            self.Bullet = source
+
+    def __getitem__(self, key):
+        # UE4SS structs are read by field name; mirror that for the simulator.
+        return getattr(self, str(key), None)
 
 
 class FrameValue:
@@ -618,6 +649,47 @@ def scenario_combo(mod_dir: Path) -> dict:
     return status
 
 
+def scenario_projectile_is_dodged(mod_dir: Path) -> dict:
+    """An arrow must be dodged: a flying attack cannot be parried."""
+    sim = Sim(mod_dir)
+    sim.actions = [Actor('IA_Stance', 'InputAction'), Actor('IA_Deflect', 'InputAction'),
+                   Actor('IA_Dodge', 'InputAction'), Actor('IA_DodgeHold', 'InputAction')]
+    sim.actor = Actor('BP_Renewal_Hun_C_1', 'BP_Renewal_Hun_C', (0, 0, 0))
+    sim.actor.attributes = AttributeSet(sim.actor, {'Health': 1000.0, 'Health_Max': 1000.0,
+                                                    'Shachi': 400.0, 'Shachi_Max': 400.0})
+    sim.deflect = DeflectComponent(sim.actor)
+    build(sim, MOD_SOURCE.read_text(encoding='utf-8'))
+    sim.write_control()
+    sim.step(1 / 60, 2)
+    sim.deflect.ReceiveFrames.frames[11] = Frame(
+        sim.game_time + 0.04, source=BulletSource('BP_Bullet_Bandit_Arrow_C'))
+    sim.step(1 / 60, 60)
+    names = [name for name, _ in sim.injections]
+    assert 'IA_Dodge' in names, names
+    return sim.read_status()
+
+
+def scenario_sweep_is_parried(mod_dir: Path) -> dict:
+    """A melee sweep still goes to the parry, not the dodge."""
+    sim = Sim(mod_dir)
+    sim.actions = [Actor('IA_Stance', 'InputAction'), Actor('IA_Deflect', 'InputAction'),
+                   Actor('IA_Dodge', 'InputAction'), Actor('IA_DodgeHold', 'InputAction')]
+    sim.actor = Actor('BP_Renewal_Hun_C_1', 'BP_Renewal_Hun_C', (0, 0, 0))
+    sim.actor.attributes = AttributeSet(sim.actor, {'Health': 1000.0, 'Health_Max': 1000.0,
+                                                    'Shachi': 400.0, 'Shachi_Max': 400.0})
+    sim.deflect = DeflectComponent(sim.actor)
+    build(sim, MOD_SOURCE.read_text(encoding='utf-8'))
+    sim.write_control()
+    sim.step(1 / 60, 2)
+    sim.deflect.ReceiveFrames.frames[12] = Frame(
+        sim.game_time + 0.04, source=BulletSource('PBZ_SweepTraceBullet'))
+    sim.step(1 / 60, 60)
+    names = [name for name, _ in sim.injections]
+    assert 'IA_Deflect' in names, names
+    assert 'IA_Dodge' not in names, names
+    return sim.read_status()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--keep', action='store_true')
@@ -633,6 +705,8 @@ def main() -> int:
         'inject_failure': scenario_inject_failure,
         'attack_no_damage': scenario_attack_no_damage,
         'combo': scenario_combo,
+        'projectile_dodge': scenario_projectile_is_dodged,
+        'sweep_parry': scenario_sweep_is_parried,
     }
     for name, run in scenarios.items():
         mod_dir = base / name

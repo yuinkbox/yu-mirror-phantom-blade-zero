@@ -7,7 +7,7 @@
 --   * everything the game does not expose falls back to timed rotation.
 local UEHelpers = require('UEHelpers')
 
-local VERSION = '0.14.2'
+local VERSION = '0.15.2'
 local SCHEMA = '2'
 local ScriptDir = debug.getinfo(1, 'S').source:match('^@(.*[\\/])') or './'
 
@@ -44,7 +44,7 @@ local Config = {
   shadow_enabled = true, switch_enabled = true, lock_enabled = true,
   combo_enabled = true,
   heal_threshold = 0.4, attack_distance = 3.5, attack_period = 0.46,
-  combo_preset = 'balanced',
+  combo_preset = 'balanced', combo_rotate = true,
   blue_response = 'deflect', red_response = 'dodge', normal_response = 'deflect',
   parry_lead = 0.16, guard_lead = 0.18, dodge_lead = 0.11,
   block_hold = 0.22, dodge_hold = 0.12, stale_after = 0.12, max_burst = 60,
@@ -84,6 +84,8 @@ local PLANS = {
   light    = { 'A' },
 }
 local KEY_ROLE = { A = 'attack_light', B = 'attack_heavy' }
+-- rotating plans keeps the strings varied without giving up the heavy finisher
+local PLAN_ORDER = { 'balanced', 'pressure', 'swift', 'balanced', 'light' }
 
 local Status = {
   schema = SCHEMA, mod_version = VERSION, loaded = '1', running = '0',
@@ -107,7 +109,7 @@ local Cache = {
   specs = nil, next_spec_scan = 0, move_durations = {},
   src_field = '', type_field = '', src_info = '', src_classes = {},
   pawn_key = '', pawn_misses = 0, hit_dist = 0, whiff_dist = 0, lock_key = '',
-  heal_prefer_alt = false, heal_gourd_fails = 0, spec_field = nil,
+  heal_prefer_alt = false, heal_gourd_fails = 0, spec_field = nil, area_until = 0, area_dodges = 0,
 }
 
 local Tracked = {}
@@ -127,9 +129,22 @@ local Counters = {
   inj_ok = 0, inj_fail = 0, missing = 0, frames = 0, frames_late = 0, attack_fail = 0,
   heal_ok = 0, heal_fail = 0, attack_ok = 0, attack_no_damage = 0,
   parry = 0, dodge_red = 0, guard = 0, def_ok = 0, def_fail = 0, combo_press = 0, guard_hold = 0,
+  shadow_uses = 0, shield_breaks = 0,
 }
 local Kinds = { normal = 0, blue = 0, red = 0, power = 0, hold = 0, unknown = 0 }
-local Combo = { chain = '', since = 0, step = 0, last_press = 0 }
+local Combo = { chain = '', since = 0, step = 0, last_press = 0, plan_index = 1, target_key = '' }
+
+local function PlanFor()
+  if Config.combo_rotate then
+    return PLANS[PLAN_ORDER[Combo.plan_index] or 'balanced'] or PLANS.balanced
+  end
+  return PLANS[Config.combo_preset] or PLANS.balanced
+end
+
+local function PlanName()
+  if Config.combo_rotate then return PLAN_ORDER[Combo.plan_index] or 'balanced' end
+  return Config.combo_preset
+end
 -- Timed fallback used when the ability array cannot be read: follow the same
 -- A/A/A/B plan and adapt the cadence from the measured hit rate.
 local Plan = { step = 0, period = 0.46, delay = {}, ok = 0, miss = 0, mode = 'ability' }
@@ -193,7 +208,7 @@ local function ReadControl(now)
   for _, key in ipairs({
     'heal_enabled', 'attack_enabled', 'guard_enabled', 'dodge_enabled',
     'execution_enabled', 'skills_enabled', 'shadow_enabled', 'switch_enabled',
-    'lock_enabled', 'combo_enabled',
+    'lock_enabled', 'combo_enabled', 'combo_rotate',
   }) do
     if data[key] ~= nil then Config[key] = data[key] == '1' end
   end
@@ -297,6 +312,10 @@ local function WriteDiag(force)
   line('attack_ok', Counters.attack_ok)
   line('attack_no_damage', Counters.attack_no_damage)
   line('attack_fail', Counters.attack_fail)
+  line('shadow_uses', Counters.shadow_uses)
+  line('shield_breaks', Counters.shield_breaks)
+  line('target_shield', tostring((Cache.enemies[1] and Cache.enemies[1].shield) or 'nil'))
+  line('shield_field', (Cache.enemies[1] and Cache.enemies[1].shield_field) or 'none')
   line('heal_ok', Counters.heal_ok)
   line('heal_fail', Counters.heal_fail)
   line('heal_last', Cache.heal_last or 'none')
@@ -324,6 +343,8 @@ local function WriteDiag(force)
   table.sort(classes)
   line('src_classes', table.concat(classes, ','))
   line('combo_preset', Config.combo_preset)
+  line('combo_plan', PlanName())
+  line('combo_rotate', tostring(Config.combo_rotate == true))
   line('combo_mode', Plan.mode)
   line('combo_period_ms', string.format('%.0f', Plan.period * 1000))
   local delays = {}
@@ -502,6 +523,17 @@ local function Attribute(set, name)
   return nil
 end
 
+local SHIELD_FIELDS = { 'Shield', 'Shield_Max', 'BreakShield', 'BreakValue', 'Poise',
+                        'GuardValue', 'ShieldValue', 'ArmorValue' }
+
+local function ShieldOf(set)
+  for _, name in ipairs(SHIELD_FIELDS) do
+    local value = Attribute(set, name)
+    if type(value) == 'number' and value > 0 then return value, name end
+  end
+  return nil
+end
+
 local function ReadHP(actor)
   local set = AttrSet(actor)
   if not set then return nil, nil end
@@ -576,10 +608,12 @@ local function CollectEnemy(enemies, actor, class_name, px, py, pz, faction)
   local hp = set and Attribute(set, 'Health')
   local maximum = set and Attribute(set, 'Health_Max')
   if hp ~= nil and maximum ~= nil and (maximum <= 0 or hp <= 0) then return end
+  local shield, shield_field = nil, nil
+  if set then shield, shield_field = ShieldOf(set) end
   enemies[#enemies + 1] = {
     actor = actor, name = Name(actor), class = class_name, distance = distance,
     hp = hp, hp_max = maximum, faction = faction or '', has_attr = set ~= nil,
-    shield = set and Attribute(set, 'Shield'),
+    shield = shield, shield_field = shield_field,
   }
 end
 
@@ -603,7 +637,7 @@ local function RefreshEnemySnapshot(pawn)
               -- dead, drop
             else
               enemy.hp, enemy.hp_max = hp, maximum
-              enemy.shield = Attribute(set, 'Shield')
+              enemy.shield, enemy.shield_field = ShieldOf(set)
               alive[#alive + 1] = enemy
             end
           else
@@ -791,16 +825,21 @@ local function SourceKind(source)
   return 'unknown', 0
 end
 
+local PROJECTILE_HINTS = { 'Grenade', 'Projectile', 'Explosive', 'Arrow', 'Bolt', 'Dart',
+                           'Throwable', 'Missile', 'Bullet', 'Shot' }
+
 local function IsAreaAttack(source)
-  -- grenades and overlap bullets explode on their own schedule; a parry does
-  -- not cover them, so they are always answered with a dodge.
+  -- Anything that flies at you cannot be answered by standing still and
+  -- parrying.  Melee sweeps published as *SweepTraceBullet* are the one
+  -- exception and must stay parryable.
   if not Valid(source) then return false end
   local class = Name(Try(function() return source:GetClass() end) or nil)
   if class == '' then return false end
-  return class:find('Grenade', 1, true) ~= nil
-      or class:find('OverlapBullet', 1, true) ~= nil
-      or class:find('Projectile', 1, true) ~= nil
-      or class:find('Explosive', 1, true) ~= nil
+  if class:find('SweepTrace', 1, true) then return false end
+  for _, hint in ipairs(PROJECTILE_HINTS) do
+    if class:find(hint, 1, true) then return true end
+  end
+  return false
 end
 
 local function ResponseFor(kind)
@@ -877,9 +916,19 @@ end
 
 local function DefenseTick(now, game_time, shachi)
   if not Config.guard_enabled and not Config.dodge_enabled then return false end
-  -- No standing guard: holding the block button makes the game keep the blade
-  -- up forever, which stops both attacks and the healing path.  Defense is
-  -- reaction only, and every press is released again below.
+  -- Projectiles and delayed explosions publish their frame too late for a
+  -- parry, so once one is seen the controller keeps dodging for a moment.
+  if now < Cache.area_until and now >= NextGuardHold and Cache.area_dodges < 3 then
+    if InjectRole('dodge') then
+      InjectRole('dodge_hold')
+      NextGuardHold = now + 0.22
+      Cache.area_dodges = (Cache.area_dodges or 0) + 1
+      Counters.dodge_red = Counters.dodge_red + 1
+      Counters.dodges = Counters.dodges + 1
+      if Config.run then Status.action = 'projectile_dodge' end
+      return true
+    end
+  end
   if not Valid(Cache.deflect) then return false end
   local ok, frames = pcall(ReadFrames, Cache.deflect)
   if not ok then return false end
@@ -899,8 +948,19 @@ local function DefenseTick(now, game_time, shachi)
       tracked = { hit = frame.hit, isDodge = frame.isDodge, first_dt = dt }
       local source = FrameSource(frame.raw)
       local kind, raw = SourceKind(source)
-      if IsAreaAttack(source) then kind = 'red' end
+      local area = IsAreaAttack(source)
+      if area then
+        kind = 'red'
+        tracked.area = true
+        Cache.area_until = now + 0.55
+        Cache.area_dodges = 0
+      end
       if kind == 'unknown' and frame.isDodge then kind = 'red' end
+      if PBZ_DEBUG then
+        print(string.format('[PBZ] frame kind=%s area=%s srcfield=%s class=%s',
+          tostring(kind), tostring(area), tostring(Cache.src_field),
+          tostring(Name(Try(function() return source:GetClass() end) or nil))))
+      end
       tracked.kind, tracked.raw = kind, raw
       CountKind(kind)
       Tracked[handle] = tracked
@@ -1060,7 +1120,7 @@ function ReadChain(now)
 end
 
 local function PlanPrefix(chain)
-  local plan = PLANS[Config.combo_preset]
+  local plan = PlanFor()
   for i = 1, #chain do
     if plan[i] ~= chain:sub(i, i) then return false end
   end
@@ -1085,7 +1145,7 @@ local function ComboStep(now, chain)
     end
     return nil
   end
-  local plan = PLANS[Config.combo_preset]
+  local plan = PlanFor()
   local key = plan[#chain + 1]
   if key == nil then
     if now - Combo.since > Config.chain_timeout * 0.6 then
@@ -1121,13 +1181,14 @@ local function NoteTargetHP(target, now)
     if #PendingHits > 0 then
       local entry = table.remove(PendingHits, 1)
       Counters.attack_ok = Counters.attack_ok + 1
-      -- a landed swing proves the reach; a whiff pulls it back in
-      local ceiling = math.min(3.8, Config.attack_distance)
-      Cache.reach = math.min(ceiling, (Cache.reach or Config.attack_distance) + 0.03)
+      -- the swing that landed tells us where the weapon actually reaches
+      if entry and entry.dist then
+        Cache.reach = math.min(Config.attack_distance, math.max(1.9, entry.dist + 0.45))
+      end
       if entry and entry.dist then Cache.hit_dist = entry.dist end
       if entry and entry.step then
         local base = Plan.delay[entry.step] or Plan.period
-        Plan.delay[entry.step] = math.max(0.26, base * 0.97)
+        Plan.delay[entry.step] = math.max(0.30, math.min(0.75, base * 0.97))
       end
     end
   end
@@ -1135,11 +1196,11 @@ local function NoteTargetHP(target, now)
   while #PendingHits > 0 and now - PendingHits[1].at > 0.9 do
     local entry = table.remove(PendingHits, 1)
     Counters.attack_no_damage = Counters.attack_no_damage + 1
-    Cache.reach = math.max(2.6, (Cache.reach or Config.attack_distance) - 0.10)
+    Cache.reach = math.max(1.9, (Cache.reach or Config.attack_distance) - 0.06)
     if entry and entry.dist then Cache.whiff_dist = entry.dist end
     if entry and entry.step then
       local base = Plan.delay[entry.step] or Plan.period
-      Plan.delay[entry.step] = math.min(0.95, base * 1.10)
+      Plan.delay[entry.step] = math.min(0.75, base * 1.05)
     end
   end
 end
@@ -1237,6 +1298,19 @@ local function CombatTick(now, game_time, pawn, hp, hp_max, enemies)
   Status.enemy_count = tostring(count)
   Status.target = target and target.name or ''
   Status.target_distance = target and string.format('%.2f', target.distance) or ''
+  if target then
+    local key = Address(target.actor)
+    if key and key ~= Combo.target_key then
+      -- a fresh target gets the next plan in the rotation: the strings stay
+      -- varied, and every third one still ends on a heavy finisher.  The very
+      -- first engagement keeps the plan the user picked.
+      if Combo.target_key ~= '' then
+        Combo.plan_index = (Combo.plan_index % #PLAN_ORDER) + 1
+      end
+      Combo.target_key = key
+      Combo.chain, Combo.step = '', 0
+    end
+  end
   NoteTargetHP(target, now)
 
   if HealTick(now, hp, hp_max) then return end
@@ -1281,6 +1355,7 @@ local function CombatTick(now, game_time, pawn, hp, hp_max, enemies)
       local done_key = same_target and Address(target.actor) or nil
       if same_target and shield_broken then
         if done_key then ShadowDone[done_key] = true end
+        Counters.shield_breaks = Counters.shield_breaks + 1
         Status.action = 'shield_broken'
       elseif same_target and shadow_resource and shadow_resource < ShadowPending.resource then
         if done_key then ShadowDone[done_key] = true end
@@ -1297,12 +1372,12 @@ local function CombatTick(now, game_time, pawn, hp, hp_max, enemies)
     end
   end
 
-  if Config.shadow_enabled and target and target.distance <= math.min(4, Config.attack_distance)
-      and type(target.shield) == 'number' and target.shield > 0
+  if Config.shadow_enabled and target and target.distance <= math.min(5, Config.attack_distance)
       and shadow_resource and shadow_resource > 0 and not ShadowDone[Address(target.actor)]
       and now >= NextShadow then
     if InjectRole('shadow_arm') then
-      ShadowPending = { target = target.actor, until_time = now + 0.8, resource = shadow_resource }
+      ShadowPending = { target = target.actor, until_time = now + 0.9, resource = shadow_resource }
+      Counters.shadow_uses = Counters.shadow_uses + 1
       Status.action = 'shadow_charge'
       return
     end
@@ -1338,7 +1413,7 @@ local function CombatTick(now, game_time, pawn, hp, hp_max, enemies)
     -- learn its own delay from whether that swing actually landed.
     Combo.chain, Combo.step = '', 0
     if now < NextAttack then return end
-    local plan = PLANS[Config.combo_preset]
+    local plan = PlanFor()
     Plan.step = (Plan.step % #plan) + 1
     local key = plan[Plan.step]
     local role = KEY_ROLE[key]
