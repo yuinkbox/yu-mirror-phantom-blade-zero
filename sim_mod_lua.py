@@ -537,6 +537,12 @@ def scenario_attack_no_damage(mod_dir: Path) -> dict:
     assert int(status['attacks']) > 0, status
     assert int(status['attack_no_damage']) > 0, status
     assert status['attack_ok'] == '0', status
+    diag = sim.read_diag()
+    # everything whiffed: the reach must have been pulled in from the 7 m that
+    # control.ini requested, and the per-step delays must have been learned
+    reach = float(diag.get('reach_m', '7'))
+    assert 2.6 <= reach < 7.0, diag
+    assert diag.get('plan_delays_ms'), diag
     return status
 
 
