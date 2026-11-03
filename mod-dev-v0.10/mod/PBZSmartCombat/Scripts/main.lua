@@ -7,7 +7,7 @@
 --   * everything the game does not expose falls back to timed rotation.
 local UEHelpers = require('UEHelpers')
 
-local VERSION = '0.15.2'
+local VERSION = '0.16.0'
 local SCHEMA = '2'
 local ScriptDir = debug.getinfo(1, 'S').source:match('^@(.*[\\/])') or './'
 
@@ -68,8 +68,8 @@ local ROLES = {
   heal_alt      = { {'IA_UseTopItem', 'IA_UseBottomItem'}, {'usetopitem', 'usebottomitem'} },
   execution     = { {'IA_Execution', 'IA_Execute'}, {'execution', 'execute'} },
   combat_art    = { {'IA_CombatArt', 'IA_Skill'}, {'combatart', 'skill'} },
-  shadow_arm    = { {'IA_ShadowArm', 'IA_ChangeShachiWeapon', 'IA_ShachiAbility'},
-                    {'shadowarm', 'changeshachi', 'shachi'} },
+  shadow_arm    = { {'IA_ShachiAbility', 'IA_ShadowArm', 'IA_ChangeArmed', 'IA_ChangeShachiWeapon'},
+                    {'shachiability', 'shadowarm', 'changearmed', 'changeshachi'} },
   change_weapon = { {'IA_ChangeWeapon', 'IA_SwitchWeapon'}, {'changeweapon', 'switchweapon'} },
   lock_on       = { {'IA_LockTarget', 'IA_Lock'}, {'locktarget', 'lockon'} },
 }
@@ -320,6 +320,8 @@ local function WriteDiag(force)
   line('heal_fail', Counters.heal_fail)
   line('heal_last', Cache.heal_last or 'none')
   line('heal_prefer_alt', tostring(Cache.heal_prefer_alt == true))
+  line('heal_gourd_fails', tostring(Cache.heal_gourd_fails or 0))
+  line('shadow_action', (RoleEntry('shadow_arm') and RoleEntry('shadow_arm').name) or 'missing')
   line('reach_m', string.format('%.2f', Cache.reach or Config.attack_distance))
   line('hit_dist_m', string.format('%.2f', Cache.hit_dist or 0))
   line('whiff_dist_m', string.format('%.2f', Cache.whiff_dist or 0))
@@ -929,6 +931,8 @@ local function DefenseTick(now, game_time, shachi)
       return true
     end
   end
+  -- once the dodge budget for this volley is spent, keep swinging: standing
+  -- there waiting for the next frame is worse than trading hits
   if not Valid(Cache.deflect) then return false end
   local ok, frames = pcall(ReadFrames, Cache.deflect)
   if not ok then return false end
@@ -1181,9 +1185,10 @@ local function NoteTargetHP(target, now)
     if #PendingHits > 0 then
       local entry = table.remove(PendingHits, 1)
       Counters.attack_ok = Counters.attack_ok + 1
-      -- the swing that landed tells us where the weapon actually reaches
+      -- learn from the swing that landed, but never crawl: below ~2.6 m the
+      -- character just stands there while the enemy circles
       if entry and entry.dist then
-        Cache.reach = math.min(Config.attack_distance, math.max(1.9, entry.dist + 0.45))
+        Cache.reach = math.min(Config.attack_distance, math.max(2.6, entry.dist + 0.8))
       end
       if entry and entry.dist then Cache.hit_dist = entry.dist end
       if entry and entry.step then
@@ -1196,7 +1201,7 @@ local function NoteTargetHP(target, now)
   while #PendingHits > 0 and now - PendingHits[1].at > 0.9 do
     local entry = table.remove(PendingHits, 1)
     Counters.attack_no_damage = Counters.attack_no_damage + 1
-    Cache.reach = math.max(1.9, (Cache.reach or Config.attack_distance) - 0.06)
+    Cache.reach = math.max(2.6, (Cache.reach or Config.attack_distance) - 0.04)
     if entry and entry.dist then Cache.whiff_dist = entry.dist end
     if entry and entry.step then
       local base = Plan.delay[entry.step] or Plan.period
@@ -1230,7 +1235,7 @@ local function HealTick(now, hp, hp_max)
     if hp and HealPending.hp and hp > HealPending.hp + gain then
       Counters.heal_ok = Counters.heal_ok + 1
       Counters.heals = Counters.heals + 1
-      Cache.heal_last = HealPending.stage == 0 and 'heal' or 'heal_alt'
+      Cache.heal_last = HealPending.stage <= 1 and 'heal' or 'heal_alt'
       HealPending = nil
       NextHeal = now + 4
       Status.action = 'heal_ok'
@@ -1239,10 +1244,18 @@ local function HealTick(now, hp, hp_max)
     if now >= HealPending.until_time then
       if HealPending.stage == 0 then
         Cache.heal_gourd_fails = (Cache.heal_gourd_fails or 0) + 1
-        if Cache.heal_gourd_fails >= 2 then Cache.heal_prefer_alt = true end
+        if Cache.heal_gourd_fails >= 3 then Cache.heal_prefer_alt = true end
       end
-      if HealPending.stage == 0 and HasRole('heal_alt') and InjectRole('heal_alt') then
-        HealPending = { stage = 1, hp = hp, until_time = now + 2.5 }
+      -- a drink can be swallowed by an attack animation: try the gourd one
+      -- more time before falling back to the quick-item slot
+      if HealPending.stage == 0 and InjectRole('heal') then
+        HealPending = { stage = 1, hp = hp, until_time = now + 1.6 }
+        HealPulseUntil, HealPulseRole = now + 0.6, 'heal'
+        Status.action = 'heal_retry'
+        return true
+      end
+      if HasRole('heal_alt') and InjectRole('heal_alt') then
+        HealPending = { stage = 2, hp = hp, until_time = now + 2.5 }
         HealPulseUntil, HealPulseRole = now + 0.35, 'heal_alt'
         Status.action = 'heal_alt'
         return true
@@ -1260,19 +1273,19 @@ local function HealTick(now, hp, hp_max)
   -- the gourd action is swallowed by this build; after two failures stop
   -- wasting a 2.5 s window on it and drink from the quick-item slot instead
   if Cache.heal_prefer_alt and HasRole('heal_alt') and InjectRole('heal_alt') then
-    HealPending = { stage = 1, hp = hp, until_time = now + 2.5 }
+    HealPending = { stage = 2, hp = hp, until_time = now + 2.5 }
     HealPulseUntil, HealPulseRole = now + 0.35, 'heal_alt'
     Status.action = 'heal_alt'
     return true
   end
   if InjectRole('heal') then
-    HealPending = { stage = 0, hp = hp, until_time = now + 2.5 }
-    HealPulseUntil, HealPulseRole = now + 0.35, 'heal'
+    HealPending = { stage = 0, hp = hp, until_time = now + 2.0 }
+    HealPulseUntil, HealPulseRole = now + 0.6, 'heal'
     Status.action = 'heal'
     return true
   end
   if HasRole('heal_alt') and InjectRole('heal_alt') then
-    HealPending = { stage = 1, hp = hp, until_time = now + 2.5 }
+    HealPending = { stage = 2, hp = hp, until_time = now + 2.5 }
     HealPulseUntil, HealPulseRole = now + 0.35, 'heal_alt'
     Status.action = 'heal_alt'
     return true
