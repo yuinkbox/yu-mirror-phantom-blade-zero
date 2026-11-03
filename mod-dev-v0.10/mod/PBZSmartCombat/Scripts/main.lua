@@ -85,7 +85,7 @@ local PLANS = {
 }
 local KEY_ROLE = { A = 'attack_light', B = 'attack_heavy' }
 -- rotating plans keeps the strings varied without giving up the heavy finisher
-local PLAN_ORDER = { 'balanced', 'pressure', 'swift', 'balanced', 'light' }
+local PLAN_ORDER = { 'balanced', 'pressure', 'swift', 'balanced', 'pressure' }
 
 local Status = {
   schema = SCHEMA, mod_version = VERSION, loaded = '1', running = '0',
