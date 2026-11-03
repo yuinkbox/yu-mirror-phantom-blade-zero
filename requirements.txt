@@ -1,0 +1,5 @@
+numpy>=2.0,<3
+Pillow>=11,<13
+# The simulator must run the same Lua as UE4SS (5.4). lupa>=2.2 ships Lua 5.5,
+# whose pcall/multi-return behaviour makes the stubs flaky under Lupa.
+lupa==2.1

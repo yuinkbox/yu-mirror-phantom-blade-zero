@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build-*/
+release-*/
+evidence/
+tmp-sim/
+tmp-debug/
+*.spec
+_*.py
+_*.png
+_video/
