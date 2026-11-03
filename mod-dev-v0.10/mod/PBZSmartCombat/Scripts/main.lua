@@ -7,12 +7,35 @@
 --   * everything the game does not expose falls back to timed rotation.
 local UEHelpers = require('UEHelpers')
 
-local VERSION = '0.14.1'
+local VERSION = '0.14.2'
 local SCHEMA = '2'
 local ScriptDir = debug.getinfo(1, 'S').source:match('^@(.*[\\/])') or './'
-local ModDir = ScriptDir .. '../'
-local ControlPath = ModDir .. 'control.ini'
-local DiagPath = ModDir .. 'diag.txt'
+
+-- UE4SS Lua uses the ANSI code page for file IO, so a game installed under a
+-- non-ASCII path cannot read or write the control/status files.  Detect that
+-- once and relay telemetry to %TEMP%: the fight itself still runs, and the
+-- problem shows up in the log instead of failing silently.
+local BaseDir = ScriptDir .. '../'
+local RelayPrefix = ''
+local function Writable(dir)
+  local path = dir .. '.pbz-write-probe'
+  local probe = io.open(path, 'w')
+  if not probe then return false end
+  probe:close()
+  if os.remove then pcall(os.remove, path) end
+  return true
+end
+if not Writable(BaseDir) then
+  local temp = os.getenv and os.getenv('TEMP')
+  if temp and Writable(temp .. '\\') then
+    BaseDir, RelayPrefix = temp .. '\\', 'PBZSmartCombat-'
+  end
+end
+local function ModFile(name)
+  return BaseDir .. RelayPrefix .. name
+end
+local ControlPath = ModFile('control.ini')
+local DiagPath = ModFile('diag.txt')
 
 local Config = {
   run = false, lease_until = 0, last_control = 0,
@@ -235,7 +258,7 @@ local function WriteStatus(force)
   if #used > 400 then used = used:sub(1, 400) end
   Status.actions_used = used
   StatusSlot = 1 - StatusSlot
-  local path = ModDir .. (StatusSlot == 0 and 'status-a.ini' or 'status-b.ini')
+  local path = ModFile(StatusSlot == 0 and 'status-a.ini' or 'status-b.ini')
   local f = io.open(path, 'w')
   if not f then return end
   for key, value in pairs(Status) do
@@ -308,6 +331,7 @@ local function WriteDiag(force)
     if Plan.delay[step] then delays[#delays + 1] = string.format('%d:%.0f', step, Plan.delay[step] * 1000) end
   end
   line('plan_delays_ms', table.concat(delays, ','))
+  line('io_relay', RelayPrefix ~= '' and (BaseDir .. RelayPrefix) or 'native')
   line('spec_field', Cache.spec_field or 'none')
   line('combo_chain', Combo.chain ~= '' and Combo.chain or 'idle')
   line('combo_press', Counters.combo_press)
