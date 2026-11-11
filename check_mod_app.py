@@ -15,12 +15,21 @@ def main():
         assert not app.stop_button.enabled
         assert not app.install_button.enabled
         assert not app.rollback_button.enabled
+        assert not app.loader_button.enabled
         assert mod_app.VERSION in app.title()
         assert app.threshold.get() == 40
         assert app.combo_preset.get() == '均衡'
         assert app.blue_response.get().startswith('蓝光')
+        assert app.combo_speed.get() == '标准'
+        assert app.shachi_reserve.get() == '中'
+        assert app.combo_key.get() == '鼠标侧键 1'
+        assert 'combo_hold' not in app.setting_vars
+        assert app.env_status.get().startswith('环境：')
+        assert callable(app.detect_game) and callable(app.install_loader)
         return {'version': mod_app.VERSION, 'hidden': True, 'worker_started': False,
-                'controls_disabled_until_connected': True, 'callback_errors': errors}
+                'controls_disabled_until_connected': True,
+                'environment_panel': True, 'auto_detect_button': True,
+                'callback_errors': errors}
     finally:
         app.close()
 

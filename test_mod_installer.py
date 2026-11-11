@@ -43,6 +43,11 @@ def test_install_disables_old_controllers_and_rollback_restores_exact_files(tmp_
     assert (mods / 'PBZAssist' / 'keep.lua').is_file()
     assert installer.can_rollback()
 
+    # Runtime hold-key transport must not make a managed install look edited.
+    (new_mod / 'assist.ini').write_text('hold=0\n', encoding='utf-8')
+    (new_mod / 'assist.tmp').write_text('hold=1\n', encoding='utf-8')
+    assert installer.can_rollback()
+
     assert result['backup'].is_dir()
     installer.rollback()
     assert not new_mod.exists()
@@ -95,13 +100,14 @@ def test_install_requires_existing_ue4ss_and_source(tmp_path):
         ModInstaller(exe, tmp_path / 'source').install()
 
 
-def test_upgrade_replaces_managed_files_and_keeps_rollback_working(tmp_path):
+def test_upgrade_snapshots_modified_install_and_rollback_restores_it(tmp_path):
     exe, mods, source, original = game_tree(tmp_path)
     installer = ModInstaller(exe, source)
     result = installer.install()
     mod = mods / 'PBZSmartCombat'
     (mod / 'status-a.ini').write_text('heartbeat=1\n', encoding='utf-8')
     (mod / 'diag.txt').write_text('version=0.10.0\n', encoding='utf-8')
+    (mod / 'Scripts' / 'main.lua').write_text('-- locally modified old mod', encoding='utf-8')
     (source / 'Scripts' / 'main.lua').write_text('-- upgraded mod', encoding='utf-8')
     assert installer.can_upgrade()
     upgraded = installer.upgrade()
@@ -109,9 +115,25 @@ def test_upgrade_replaces_managed_files_and_keeps_rollback_working(tmp_path):
     assert (mod / 'Scripts' / 'main.lua').read_text('utf-8') == '-- upgraded mod'
     assert (mod / 'installation.json').is_file()
     assert installer.can_rollback()
+
+    (mod / 'Scripts' / 'main.lua').write_text('-- edited new mod', encoding='utf-8')
+    assert not installer.can_rollback()
+    with pytest.raises(RuntimeError, match='新 Mod 文件'):
+        installer.rollback()
+    assert (mod / 'Scripts' / 'main.lua').read_text('utf-8') == '-- edited new mod'
+    (mod / 'Scripts' / 'main.lua').write_text('-- upgraded mod', encoding='utf-8')
+
     installer.rollback()
-    assert not mod.exists()
-    assert (mods / 'mods.txt').read_bytes() == original
+    assert (mod / 'Scripts' / 'main.lua').read_text('utf-8') == '-- locally modified old mod'
+    assert (mod / 'status-a.ini').read_text('utf-8') == 'heartbeat=1\n'
+    assert (mod / 'diag.txt').read_text('utf-8') == 'version=0.10.0\n'
+    assert (mods / 'mods.txt').read_bytes() != original
+    assert installer.can_upgrade()
+
+    (source / 'Scripts' / 'main.lua').write_text('-- next upgrade', encoding='utf-8')
+    assert installer.upgrade()['changed']
+    installer.rollback()
+    assert (mod / 'Scripts' / 'main.lua').read_text('utf-8') == '-- locally modified old mod'
 
 
 def test_upgrade_with_identical_source_reports_no_change(tmp_path):
@@ -121,13 +143,45 @@ def test_upgrade_with_identical_source_reports_no_change(tmp_path):
     assert installer.upgrade()['changed'] is False
 
 
-def test_upgrade_refuses_when_installed_files_were_edited(tmp_path):
+def test_upgrade_allows_hash_drift_only_for_owned_install_and_snapshots_it(tmp_path):
     exe, mods, source, _ = game_tree(tmp_path)
     installer = ModInstaller(exe, source)
     installer.install()
     (mods / 'PBZSmartCombat' / 'Scripts' / 'main.lua').write_text('-- user edit', encoding='utf-8')
     (source / 'Scripts' / 'main.lua').write_text('-- next', encoding='utf-8')
-    assert not installer.can_upgrade()
-    with pytest.raises(RuntimeError):
-        installer.upgrade()
+    assert installer.can_upgrade()
+    assert installer.upgrade()['changed']
+    installer.rollback()
     assert (mods / 'PBZSmartCombat' / 'Scripts' / 'main.lua').read_text('utf-8') == '-- user edit'
+
+
+def test_upgrade_rejects_marker_that_does_not_match_managed_backup(tmp_path):
+    exe, mods, source, _ = game_tree(tmp_path)
+    installer = ModInstaller(exe, source)
+    installer.install()
+    marker = mods / 'PBZSmartCombat' / 'installation.json'
+    marker.write_text(json.dumps({'managed_by': 'PBZSmartCombat', 'backup': 'other'}), 'utf-8')
+    assert not installer.can_upgrade()
+    with pytest.raises(RuntimeError, match='不匹配'):
+        installer.upgrade()
+
+
+def test_upgrade_replace_failure_restores_original_directory(tmp_path, monkeypatch):
+    exe, mods, source, _ = game_tree(tmp_path)
+    installer = ModInstaller(exe, source)
+    installer.install()
+    original = mods / 'PBZSmartCombat' / 'Scripts' / 'main.lua'
+    original.write_text('-- modified old version', encoding='utf-8')
+    (source / 'Scripts' / 'main.lua').write_text('-- next', encoding='utf-8')
+    replace = Path.replace
+
+    def fail_staging_replace(path, target):
+        if path.name.startswith('.PBZSmartCombat-upgrading-'):
+            raise OSError('simulated replace failure')
+        return replace(path, target)
+
+    monkeypatch.setattr(Path, 'replace', fail_staging_replace)
+    with pytest.raises(OSError, match='simulated'):
+        installer.upgrade()
+    assert original.read_text('utf-8') == '-- modified old version'
+    assert installer.can_upgrade()

@@ -47,6 +47,17 @@ def worker(monkeypatch,tmp_path,observe=False):
     return app,app.Worker(CombatSettings(),queue.Queue(),observe=observe)
 
 
+def test_settings_preserve_configured_attack_cadence(monkeypatch, tmp_path):
+    import mod_app as app
+    monkeypatch.setattr(app, 'DATA', tmp_path)
+    (tmp_path / 'settings.json').write_text('{"attack_period":0.35}', 'utf-8')
+    assert app.load_settings()['attack_period'] == 0.35
+    (tmp_path / 'settings.json').write_text('{"attack_period":0.46}', 'utf-8')
+    assert app.load_settings()['attack_period'] == 0.46
+    (tmp_path / 'settings.json').write_text('{"attack_period":0.62}', 'utf-8')
+    assert app.load_settings()['attack_period'] == 0.62
+
+
 def test_existing_stable_version_never_registers_hotkeys_or_arms(monkeypatch,tmp_path):
     app,w=worker(monkeypatch,tmp_path)
     monkeypatch.setattr(app,'peer_processes',lambda:[dict(pid=42,name='PBZ战斗助手.exe')])
@@ -316,6 +327,8 @@ def test_defense_release_does_not_release_manual_or_untracked_keys(monkeypatch):
 
 
 def test_new_settings_do_not_read_stable_data_folder():
+    from pathlib import Path
     import runtime_app as app
     assert app.DATA.name=='data-next' and app.SETTINGS.parent==app.DATA
-    assert app.ROOT.name=='PBZ-assistant-next'
+    assert app.ROOT == Path(app.__file__).resolve().parent
+    assert app.DATA.parent == app.ROOT

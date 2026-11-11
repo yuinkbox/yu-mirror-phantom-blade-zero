@@ -1,80 +1,149 @@
-<#
-  setup_dev.ps1 -- bootstrap the PBZ combat assistant project on a fresh Windows machine.
-
-  Usage:
-    powershell -ExecutionPolicy Bypass -File setup_dev.ps1                 # test + simulate + build
-    powershell -ExecutionPolicy Bypass -File setup_dev.ps1 -InstallMod    # also install the mod into the game
-    powershell -ExecutionPolicy Bypass -File setup_dev.ps1 -GameExe "E:\Steam\steamapps\common\PBZ\platform\steam\PBZ.exe" -InstallMod
-
-  Run it from the project root (the folder that contains mod_app.py).
+﻿<#
+.SYNOPSIS
+Create an isolated Windows Python 3.12 development environment, test, and build.
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File .\setup_dev.ps1
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File .\setup_dev.ps1 -PythonExe C:\Python312\python.exe -Offline
+.NOTES
+Uses ../dependencies/wheels automatically when available. Does not install or
+change game files. Use the desktop assistant to install the Mod after testing.
 #>
 [CmdletBinding()]
 param(
-  [string]$GameExe,
-  [switch]$InstallMod,
-  [switch]$SkipBuild
+    [string]$PythonExe,
+    [string]$Wheelhouse,
+    [switch]$Offline,
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = 'Stop'
-Set-Location -LiteralPath $PSScriptRoot
+$priorPythonUtf8 = $env:PYTHONUTF8
+$priorConsoleOutputEncoding = [Console]::OutputEncoding
+$priorPipelineOutputEncoding = $OutputEncoding
+$utf8OutputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8OutputEncoding
+$OutputEncoding = $utf8OutputEncoding
+$env:PYTHONUTF8 = '1'
 
-function Step($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
-function Need($path, $label) {
-  if (-not (Test-Path -LiteralPath $path)) { throw "缺少 $label : $path" }
+function Step([string]$Text) {
+    Write-Host "`n=== $Text ===" -ForegroundColor Cyan
+}
+function NeedFile([string]$Path, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "缺少 $Label : $Path"
+    }
+}
+function CheckExit([string]$Label) {
+    if ($LASTEXITCODE -ne 0) { throw "$Label 失败，退出码 $LASTEXITCODE" }
 }
 
-Step '0. 检查目录'
-Need 'mod_app.py' '项目根（mod_app.py）'
-Need 'mod-dev-v0.10\mod\PBZSmartCombat\Scripts\main.lua' 'mod 源码'
-Write-Host "项目根: $PSScriptRoot"
+Push-Location -LiteralPath $PSScriptRoot
+try {
+    Step '检查项目和依赖目录'
+    NeedFile 'mod_app.py' '桌面源码'
+    NeedFile 'requirements-dev.txt' '开发依赖清单'
+    NeedFile 'mod-dev-v0.10\mod\PBZSmartCombat\Scripts\main.lua' 'Mod 源码'
+    NeedFile 'mod-dev-v0.10\mod\PBZSmartCombat\Scripts\community_defense.lua' '防御模块'
+    NeedFile 'mod-dev-v0.10\mod\PBZSmartCombat\Scripts\weapon_switch.lua' '切刀模块'
+    $versionMatch = [regex]::Match(
+        [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'mod_app.py')),
+        "(?m)^VERSION\s*=\s*'([^']+)'")
+    if (-not $versionMatch.Success) { throw '无法从 mod_app.py 读取版本号' }
+    $appVersion = $versionMatch.Groups[1].Value
 
-Step '1. 检查 Python'
-$py = (Get-Command python -ErrorAction SilentlyContinue)
-if (-not $py) { throw '找不到 python。请安装 Python 3.12 64 位并勾选 Add to PATH。' }
-& python -c "import sys; assert sys.version_info[:2] >= (3,10); assert sys.maxsize > 2**32, '需要 64 位'; print(sys.version)"
-if ($LASTEXITCODE -ne 0) { throw 'Python 版本/位数不满足要求（需 3.10+ 64 位）。' }
+    $explicitWheelhouse = -not [string]::IsNullOrWhiteSpace($Wheelhouse)
+    if (-not $explicitWheelhouse) {
+        $Wheelhouse = Join-Path (Split-Path -Parent $PSScriptRoot) 'dependencies\wheels'
+    }
+    $hasWheelhouse = Test-Path -LiteralPath $Wheelhouse -PathType Container
+    if ($hasWheelhouse) {
+        $Wheelhouse = (Resolve-Path -LiteralPath $Wheelhouse).Path
+        $hasWheelhouse = @(Get-ChildItem -LiteralPath $Wheelhouse -Filter '*.whl' -File).Count -gt 0
+    }
+    if (($Offline -or $explicitWheelhouse) -and -not $hasWheelhouse) {
+        throw "离线依赖目录不存在或没有 wheel 文件：$Wheelhouse"
+    }
 
-Step '2. 安装依赖'
-& python -m pip install --upgrade pip
-& python -m pip install -r requirements.txt
-& python -m pip install pytest lupa pyinstaller imageio-ffmpeg
-if ($LASTEXITCODE -ne 0) { throw 'pip 安装失败' }
+    Step '检查 Python 3.12 x64'
+    $bootstrapArgs = @()
+    if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+        $pythonLauncher = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue
+        if ($pythonLauncher) {
+            $PythonExe = $pythonLauncher.Source
+            $bootstrapArgs = @('-3.12')
+        } else {
+            $pythonCommand = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue
+            if (-not $pythonCommand) {
+                throw '找不到 Python。请安装 Python 3.12 x64，或用 -PythonExe 指定 python.exe。'
+            }
+            $PythonExe = $pythonCommand.Source
+        }
+    }
+    $pythonCheck = "import sys, tkinter, venv; assert sys.platform == 'win32' and sys.version_info[:2] == (3, 12) and sys.maxsize > 2**32, 'Requires Windows Python 3.12 x64 with tkinter and venv'; print(sys.executable, sys.version)"
+    & $PythonExe @bootstrapArgs -c $pythonCheck
+    CheckExit 'Python 检查'
 
-Step '3. 单元测试（期望 382 passed）'
-$files = (Get-ChildItem -Filter 'test_*.py').Name
-& python -m pytest -q @files -p no:cacheprovider
-if ($LASTEXITCODE -ne 0) { throw '单元测试失败，先修测试再继续。' }
+    $venvDir = Join-Path $PSScriptRoot '.venv'
+    $venvPython = Join-Path $venvDir 'Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+        & $PythonExe @bootstrapArgs -m venv $venvDir
+        CheckExit '创建 .venv'
+    }
+    & $venvPython -c $pythonCheck
+    CheckExit '.venv 检查；若旧 .venv 来自另一台电脑，请在新目录解压迁移包后重试'
 
-Step '4. 离线仿真 mod（期望 simulated 7 scenarios from main.lua）'
-& python sim_mod_lua.py
-if ($LASTEXITCODE -ne 0) { throw '仿真失败，先修 main.lua。' }
+    Step '安装固定版本的开发依赖'
+    $pipArgs = @('-m', 'pip', 'install', '--disable-pip-version-check')
+    if ($hasWheelhouse) {
+        Write-Host "使用离线依赖：$Wheelhouse"
+        $pipArgs += @('--no-index', '--find-links', $Wheelhouse)
+    } else {
+        Write-Host '包内没有离线依赖，将通过 pip 联网下载。'
+    }
+    $pipArgs += @('-r', 'requirements-dev.txt')
+    & $venvPython @pipArgs
+    CheckExit '安装依赖'
+    & $venvPython -m pip check
+    CheckExit '依赖一致性检查'
+    & $venvPython -c "import lupa; assert lupa.__version__ == '2.1', 'Expected lupa==2.1'; print('Lua runtime:', lupa.LuaRuntime().eval('_VERSION'))"
+    CheckExit 'Lua 运行时检查'
 
-if (-not $SkipBuild) {
-  Step '5. 打包 exe'
-  & python build_mod010.py
-  if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 构建失败（先确认 build_mod010.py 里没有这台机器专有的 build_deps 路径）。' }
-  $exe = Get-ChildItem -Path 'release-0.12.0' -Filter '*.exe' | Select-Object -First 1
-  if (-not $exe) { throw '没找到构建出的 exe' }
-  Step '6. exe 冒烟检查'
-  & python check_mod_app.py $exe.FullName
-  if ($LASTEXITCODE -ne 0) { throw 'exe 冒烟检查失败' }
+    Step '运行完整单元测试'
+    $testFiles = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'test_*.py' -File |
+        Sort-Object Name | ForEach-Object { $_.FullName })
+    if ($testFiles.Count -eq 0) { throw '项目没有 test_*.py 测试文件' }
+    & $venvPython -m pytest -q @testFiles -p no:cacheprovider
+    CheckExit '单元测试'
+
+    Step '运行真实 Lua 源码仿真'
+    & $venvPython sim_mod_lua.py
+    CheckExit 'Lua 仿真'
+
+    Step '桌面源码自检'
+    & $venvPython check_mod_app.py
+    CheckExit '桌面源码自检'
+
+    if (-not $SkipBuild) {
+        Step "构建 $appVersion"
+        & $venvPython build_mod010.py
+        CheckExit 'PyInstaller 构建'
+        $releaseDir = Join-Path $PSScriptRoot "release-$appVersion"
+        $releaseExe = Join-Path $releaseDir "PBZ战斗助手-$appVersion.exe"
+        NeedFile $releaseExe '构建产物'
+        Step '独立 EXE 启动自检'
+        & $venvPython -c "import subprocess, sys; result = subprocess.run([sys.argv[1], '--smoke-test'], timeout=30); raise SystemExit(result.returncode)" $releaseExe
+        CheckExit '独立 EXE 启动自检'
+        Write-Host "输出：$releaseExe" -ForegroundColor Green
+    }
+
+    Step '完成'
+    Write-Host "开发解释器：$venvPython" -ForegroundColor Green
+    Write-Host '本脚本只配置开发环境和验证程序；游戏文件未安装或更新。'
+    Write-Host '需要使用 Mod 时，先退出游戏，再打开助手选择游戏并点击“安装/升级 Mod”。'
+} finally {
+    Pop-Location
+    $env:PYTHONUTF8 = $priorPythonUtf8
+    [Console]::OutputEncoding = $priorConsoleOutputEncoding
+    $OutputEncoding = $priorPipelineOutputEncoding
 }
-
-if ($InstallMod) {
-  Step '7. 安装/升级 mod 到游戏目录'
-  if (-not $GameExe) {
-    $GameExe = Read-Host '请输入 PBZ.exe 的完整路径'
-  }
-  Need $GameExe 'PBZ.exe'
-  & python -c "from pathlib import Path; from mod_installer import ModInstaller; i = ModInstaller(Path(r'$GameExe'), Path(r'mod-dev-v0.10\mod\PBZSmartCombat')); print(i.upgrade()); print('installed ->', i.target)"
-  if ($LASTEXITCODE -ne 0) { throw 'mod 安装失败（游戏是否在运行？先退出游戏）' }
-  Write-Host '装完要重启游戏才会加载新 mod。' -ForegroundColor Yellow
-}
-
-Step '完成'
-Write-Host @'
-下一步：
-  1) 开游戏 -> 开 release-0.12.0\PBZ战斗助手-0.12.0.exe -> 选游戏 -> F8
-  2) 打完一局把 ue4ss\Mods\PBZSmartCombat\diag.txt 和 status-a.ini 回传
-  3) 看 开发环境与迁移说明.md 第 5、6 节排查
-'@ -ForegroundColor Green

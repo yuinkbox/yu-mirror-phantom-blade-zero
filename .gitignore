@@ -1,4 +1,5 @@
 __pycache__/
+.venv/
 *.pyc
 .pytest_cache/
 build-*/
@@ -10,3 +11,8 @@ tmp-debug/
 _*.py
 _*.png
 _video/
+
+*.zip
+*.sha256.txt
+app.old.ico
+

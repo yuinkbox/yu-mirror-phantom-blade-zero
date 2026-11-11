@@ -80,6 +80,8 @@ class ModBridge:
         self.script = self.mod_dir / "Scripts" / "main.lua"
         self.control_path = self.mod_dir / "control.ini"
         self.status_path = self.mod_dir / "status.ini"
+        self.assist_session = uuid.uuid4().hex
+        self.assist_seq = 0
 
     def inspect(self, now=None):
         now = int(time.time() if now is None else now)
@@ -99,8 +101,8 @@ class ModBridge:
         elif not enabled:
             code, message = "disabled", "PBZSmartCombat 未启用"
         elif loaded:
-            code, message = ("running", "Mod 已连接 · 观测模式" if running else "Mod 已连接 · 已暂停")
-        elif status:
+            code, message = ("running", "Mod 已连接 · 辅助运行中" if running else "Mod 已连接 · 已暂停")
+        elif status or self._status_problem:
             code, message = "stale", "Mod 心跳过期或协议版本不兼容"
         else:
             code, message = "pending", "等待游戏加载 PBZSmartCombat"
@@ -112,24 +114,64 @@ class ModBridge:
             "target_distance", "weapon", "q_action", "charge_action", "action",
             "reason", "error", "attacks", "blocks", "dodges", "heals",
             "skills", "executions", "inj_ok", "inj_fail", "enemy_scan_ms",
-            "attack_ok", "attack_no_damage", "def_ok", "def_fail", "parry",
-            "dodge_red", "guard_hold", "combo_state", "combo_step", "heal_last",
-            "actions_used")})
+            "runtime_tick_ms", "runtime_tick_ms_max",
+            "attack_ok", "attack_no_damage", "attack_unverified", "def_ok", "def_fail", "def_unknown",
+            "def_perfect", "def_great", "def_normal", "def_other", "parry",
+            "dodge_red", "guard_hold", "combo_state", "combo_step", "heal_last", "heal_ok", "heal_fail",
+            "combo_mode", "combo_plan", "combo_signal", "combo_confirm", "combo_reject",
+            "combo_wait_ms", "combo_tempo", "chain_tag", "phase_tag", "heavy_ok",
+            "combo_last_reset", "combo_stalls", "combo_stall_ms", "openings",
+            "defense_engine", "defense_ready", "defense_parry_ready", "defense_dodge_ready",
+            "defense_error", "defense_checks_no_loss", "defense_checks_damage",
+            "defense_checks_unknown", "defense_api_fail", "defense_projectiles",
+            "defense_projectile_tracked", "defense_tick_ms", "defense_tick_ms_max",
+            "defense_frames_late", "heal_state", "skill_state", "skill_charges",
+            "heal_action", "heal_state_detail", "heal_candidates", "heal_blocked_ms", "heal_hold_ms",
+            "item_actions", "parry_lead_ms", "deflect_gap_ms", "def_rate",
+            "deflect_deferred",
+            "actions_used", "support_state", "support_uses", "support_confirmed",
+            "attack_interrupted", "medicine_interrupted", "combo_gate", "assist_hold",
+            "hold_to_combo")})
         result["heartbeat"] = heartbeat
         result["heartbeat_age"] = now - heartbeat if heartbeat is not None else None
         return result
 
     def _read_status(self):
         candidates = []
+        self._status_problem = False
         for path in (self.mod_dir / "status-a.ini", self.mod_dir / "status-b.ini", self.status_path):
             try:
+                before = path.stat()
                 data = parse_ini(path.read_text(encoding="utf-8-sig"))
+                after = path.stat()
             except (OSError, UnicodeError):
                 continue
             heartbeat = _integer(data.get("heartbeat"))
-            if heartbeat is not None:
-                candidates.append((heartbeat, data))
-        return max(candidates, key=lambda row: row[0])[1] if candidates else {}
+            # A slot may be truncated while the game is rewriting it. A newer
+            # heartbeat alone must not displace a complete, compatible slot.
+            complete = (data.get("schema") == SCHEMA and heartbeat is not None
+                        and data.get("loaded") in {"0", "1"}
+                        and data.get("running") in {"0", "1"})
+            stable = (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size)
+            if complete and stable:
+                candidates.append((heartbeat, after.st_mtime_ns, data))
+            else:
+                self._status_problem = True
+        return max(candidates, key=lambda row: row[:2])[2] if candidates else {}
+
+    def write_assist(self, hold, now=None, *, focused=True):
+        """Publish a physical gesture, not an attack command. Lua owns combat."""
+        if not self.mod_dir.is_dir():
+            return
+        now = int(time.time() if now is None else now)
+        self.assist_seq += 1
+        text = encode_ini({"schema": 1, "session": self.assist_session,
+                           "seq": self.assist_seq, "hold": "1" if hold and focused else "0",
+                           "focused": "1" if focused else "0", "stamp": now})
+        target = self.mod_dir / "assist.ini"
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(text, "utf-8")
+        os.replace(temporary, target)
 
     def write_control(self, run, settings=None, now=None):
         if not self.script.is_file():
@@ -138,7 +180,7 @@ class ModBridge:
                 or _enabled_from_mods_txt(self.mods_dir / "mods.txt")):
             raise RuntimeError("PBZSmartCombat is installed but not enabled in UE4SS")
         conflicts = _legacy_conflicts(self.mods_dir)
-        if conflicts:
+        if conflicts and run:
             raise RuntimeError("legacy combat mod conflict: " + ", ".join(conflicts))
         now = int(time.time() if now is None else now)
         settings = settings or {}
@@ -147,6 +189,8 @@ class ModBridge:
             "request_id": uuid.uuid4().hex,
             "run": "1" if run else "0",
             "lease_until": now + 4,
+            "combo_session": self.assist_session,
+            "combat_mode": "hold",
             "heal_enabled": _flag(settings, "heal_enabled", True),
             "attack_enabled": _flag(settings, "attack_enabled", True),
             "guard_enabled": _flag(settings, "guard_enabled", True),
@@ -155,11 +199,13 @@ class ModBridge:
             "skills_enabled": _flag(settings, "skills_enabled", True),
             "shadow_enabled": _flag(settings, "shadow_enabled", True),
             "switch_enabled": _flag(settings, "switch_enabled", True),
-            "lock_enabled": _flag(settings, "lock_enabled", True),
             "combo_enabled": _flag(settings, "combo_enabled", True),
+            "combo_macro": _flag(settings, "combo_macro", True),
             "heal_threshold": _number(settings, "threshold", 0.4),
             "attack_distance": _number(settings, "attack_distance", 3.5),
-            "attack_period": _number(settings, "attack_period", 0.48),
+            "attack_period": _number(settings, "attack_period", 0.35),
+            "combo_speed": _number(settings, "combo_speed", 1.0),
+            "shachi_reserve": _number(settings, "shachi_reserve", 0.30),
             "combo_preset": _choice(settings, "combo_preset", "balanced",
                                      {"balanced", "pressure", "swift", "light"}),
             "blue_response": _choice(settings, "blue_response", "deflect",

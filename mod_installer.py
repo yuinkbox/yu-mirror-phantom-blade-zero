@@ -14,7 +14,7 @@ LEGACY_MODS = ('PBZAssist', 'PBZAutoCombat', 'PBZAutoGuard')
 MANIFEST = 'migration.json'
 # Files the mod writes at runtime; they must never block upgrade or rollback.
 RUNTIME = frozenset({'installation.json', 'control.ini', 'status.ini', 'status-a.ini',
-                       'status-b.ini', 'diag.txt'})
+                       'status-b.ini', 'diag.txt', 'assist.ini', 'assist.tmp'})
 
 
 class ModInstaller:
@@ -107,18 +107,19 @@ class ModInstaller:
         if installed.get('managed_by') != 'PBZSmartCombat' or installed.get('backup') != backup.name:
             raise RuntimeError('目标 Mod 与备份记录不匹配，未做任何改动')
         current = _tree_hashes(self.target, exclude=RUNTIME)
-        if current != manifest.get('installed_files', {}):
-            raise RuntimeError('现有 Mod 文件被手动修改过；为保护改动，升级已停止')
         if not (self.source / 'Scripts' / 'main.lua').is_file():
             raise FileNotFoundError('新 Mod 源文件不完整')
         if all(current.get(path) == digest for path, digest in _tree_hashes(self.source).items()):
             return {'backup': backup, 'changed': False}
         staging = self.mods / f'.PBZSmartCombat-upgrading-{uuid.uuid4().hex}'
         previous = self.mods / f'.PBZSmartCombat-previous-{uuid.uuid4().hex}'
+        snapshots = backup / 'upgrade-snapshots'
+        snapshots.mkdir(exist_ok=True)
+        snapshot = snapshots / f'{datetime.now().strftime("%Y%m%d-%H%M%S")}-{uuid.uuid4().hex[:8]}'
         try:
+            shutil.copytree(self.target, snapshot)
             shutil.copytree(self.source, staging)
             (staging / 'enabled.txt').touch(exist_ok=True)
-            manifest['installed_files'] = _tree_hashes(staging)
             (staging / 'installation.json').write_text(
                 json.dumps({'managed_by': 'PBZSmartCombat', 'backup': backup.name}), 'utf-8')
             self.target.replace(previous)
@@ -127,13 +128,22 @@ class ModInstaller:
             except Exception:
                 previous.replace(self.target)
                 raise
+            old_manifest = dict(manifest)
+            manifest['installed_files'] = _tree_hashes(self.target, exclude=RUNTIME)
+            manifest['rollback_mod_archive'] = snapshot.relative_to(backup).as_posix()
+            manifest['rollback_mod_hashes'] = _tree_hashes(snapshot)
+            try:
+                _write_manifest(backup, manifest)
+            except Exception:
+                shutil.rmtree(self.target)
+                previous.replace(self.target)
+                manifest.clear()
+                manifest.update(old_manifest)
+                raise
         finally:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
         shutil.rmtree(previous, ignore_errors=True)
-        manifest['state'] = 'installed'
-        manifest['upgraded'] = True
-        (backup / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=True, indent=2), 'utf-8')
         return {'backup': backup, 'changed': True}
 
     def can_upgrade(self):
@@ -148,7 +158,7 @@ class ModInstaller:
             return False
         if installed.get('managed_by') != 'PBZSmartCombat' or installed.get('backup') != backup.name:
             return False
-        return _tree_hashes(self.target, exclude=RUNTIME) == manifest.get('installed_files', {})
+        return True
 
     def rollback(self):
         backup, manifest = self._latest_install()
@@ -173,10 +183,34 @@ class ModInstaller:
                 raise RuntimeError(f'旧插件备份标记已被修改：{disabled}')
         if _tree_hashes(self.target, exclude=RUNTIME) != manifest.get('installed_files', {}):
             raise RuntimeError('新 Mod 文件在安装后已被修改；为保护改动，回滚已停止')
-        shutil.rmtree(self.target)
-        _restore_files(self.mods, self.mods_txt, manifest)
-        manifest['state'] = 'rolled_back'
-        (backup / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=True, indent=2), 'utf-8')
+        snapshot_relative = manifest.get('rollback_mod_archive')
+        if snapshot_relative:
+            snapshot = _safe_snapshot_path(backup, snapshot_relative)
+            if not snapshot.is_dir() or _tree_hashes(snapshot) != manifest.get('rollback_mod_hashes'):
+                raise RuntimeError('升级前的 Mod 备份缺失或已损坏；未改动当前安装')
+            previous = self.mods / f'.PBZSmartCombat-rollback-{uuid.uuid4().hex}'
+            self.target.replace(previous)
+            try:
+                snapshot.replace(self.target)
+                manifest['installed_files'] = _tree_hashes(self.target, exclude=RUNTIME)
+                manifest.pop('rollback_mod_archive', None)
+                manifest.pop('rollback_mod_hashes', None)
+                try:
+                    _write_manifest(backup, manifest)
+                except Exception:
+                    self.target.replace(snapshot)
+                    previous.replace(self.target)
+                    raise
+            except Exception:
+                if previous.exists() and not self.target.exists():
+                    previous.replace(self.target)
+                raise
+            shutil.rmtree(previous, ignore_errors=True)
+        else:
+            shutil.rmtree(self.target)
+            _restore_files(self.mods, self.mods_txt, manifest)
+            manifest['state'] = 'rolled_back'
+            _write_manifest(backup, manifest)
         return backup
 
     def can_rollback(self):
@@ -187,9 +221,24 @@ class ModInstaller:
             installed = json.loads((self.target / 'installation.json').read_text('utf-8'))
         except (OSError, ValueError):
             return False
-        return (manifest.get('state') == 'installed'
+        if not (manifest.get('state') == 'installed'
                 and installed.get('managed_by') == 'PBZSmartCombat'
-                and installed.get('backup') == backup.name)
+                and installed.get('backup') == backup.name
+                and _tree_hashes(self.target, exclude=RUNTIME) == manifest.get('installed_files', {})):
+            return False
+        snapshot_relative = manifest.get('rollback_mod_archive')
+        if snapshot_relative:
+            try:
+                snapshot = _safe_snapshot_path(backup, snapshot_relative)
+                return (snapshot.is_dir()
+                        and _tree_hashes(snapshot) == manifest.get('rollback_mod_hashes'))
+            except (OSError, ValueError):
+                return False
+        return True
+
+    def rollback_restores_previous(self):
+        backup, manifest = self._latest_install()
+        return bool(backup and manifest.get('rollback_mod_archive'))
 
     def _latest_install(self):
         try:
@@ -241,6 +290,18 @@ def _restore_files(mods, mods_txt, manifest):
         elif not original.exists():
             original.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(original, base64.b64decode(row['data']))
+
+
+def _safe_snapshot_path(backup, relative):
+    candidate = (backup / relative).resolve()
+    if backup.resolve() not in candidate.parents:
+        raise ValueError('升级备份路径无效')
+    return candidate
+
+
+def _write_manifest(backup, manifest):
+    payload = json.dumps(manifest, ensure_ascii=True, indent=2).encode('utf-8')
+    _atomic_write(backup / MANIFEST, payload)
 
 
 def _atomic_write(path, data):

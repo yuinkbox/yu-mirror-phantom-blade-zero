@@ -1,0 +1,6 @@
+# Windows CPython 3.12 x64 development environment used for the 0.17.0 handoff.
+-r requirements.txt
+numpy==2.3.5
+Pillow==12.3.0
+pytest==9.2.0
+PyInstaller==6.22.3
