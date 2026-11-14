@@ -19,13 +19,13 @@ from ui_components import BG, BORDER, GREEN, MUTED, SURFACE, TEXT, AMBER
 from ui_components import Button, Panel, Switch, label
 from windows_io import Hotkeys, find_game_by_name, dpi_aware, is_down
 
-VERSION = '0.18.4'
+VERSION = '0.18.7'
 ROOT = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 DATA = ROOT / 'data-v0.10'
 DEFAULT_SETTINGS = {
     'attack_enabled': True, 'guard_enabled': True, 'dodge_enabled': True,
     'heal_enabled': True, 'execution_enabled': True, 'skills_enabled': True,
-    'shadow_enabled': False, 'combo_enabled': True, 'combo_macro': True,
+    'shadow_enabled': False, 'auto_items': False, 'combo_enabled': True, 'combo_macro': True,
     'threshold': 0.4,
     'attack_distance': 3.5, 'attack_period': 0.35, 'combo_preset': 'balanced',
     'blue_response': 'deflect', 'red_response': 'dodge',

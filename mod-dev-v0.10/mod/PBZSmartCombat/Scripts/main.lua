@@ -11,7 +11,7 @@
 --   * everything the game does not expose falls back to the window estimate.
 local UEHelpers = require('UEHelpers')
 
-local VERSION = '0.18.4'
+local VERSION = '0.18.7'
 local SCHEMA = '2'
 local ScriptDir = debug.getinfo(1, 'S').source:match('^@(.*[\\/])') or './'
 
@@ -62,7 +62,7 @@ local Config = {
   run = false, lease_until = 0, last_control = 0,
   heal_enabled = true, attack_enabled = true, guard_enabled = true,
   dodge_enabled = true, execution_enabled = true, skills_enabled = true,
-  shadow_enabled = true, switch_enabled = true,
+  shadow_enabled = false, auto_items = false, switch_enabled = true,
   combo_enabled = true,
   heal_threshold = 0.4, attack_distance = 3.5, attack_period = 0.35,
   support_hold = 0.12,
@@ -70,6 +70,10 @@ local Config = {
   -- macro mode: a held key drives the whole string on a cadence, with no
   -- chain tag, no target and no distance gate.
   combo_macro = false,
+  pre_guard_distance = 4.0,
+  pre_guard_hold = 0.22,
+  pre_guard_interval = 0.80,
+  pre_guard_quiet = 0.55,
   blue_response = 'deflect', red_response = 'dodge', normal_response = 'deflect',
   -- Defense timing. The parry window is ~10 frames (0.17 s) and starts on the
   -- press, so pressing 0.16 s early wastes it; parry_lead walks down toward
@@ -93,7 +97,7 @@ local Config = {
   late_dodge = 0.03, unknown_response = 'dodge',
   approach_enabled = true, approach_max = 30.0, approach_gap = 0.35,
   hit_floor = 2.1, hit_step = 0.10,
-  enemy_scan_interval = 0.9, enemy_retry_interval = 0.35,
+  enemy_scan_interval = 1.2, enemy_retry_interval = 0.35,
   action_overrides = {},
   combo_session = '',
 }
@@ -365,6 +369,7 @@ local function ReadControl(now)
   for _, key in ipairs({
     'heal_enabled', 'attack_enabled', 'guard_enabled', 'dodge_enabled',
     'execution_enabled', 'skills_enabled', 'shadow_enabled', 'switch_enabled',
+    'auto_items',
     'combo_enabled', 'combo_rotate', 'combo_macro',
   }) do
     if data[key] ~= nil then Config[key] = data[key] == '1' end
@@ -926,7 +931,7 @@ end
 
 local function RefreshAttrIndex(now)
   if now < Cache.next_attr_scan and next(Cache.attr_by_owner) ~= nil then return end
-  Cache.next_attr_scan = now + 2
+  Cache.next_attr_scan = now + 5.0
   Cache.attr_scans = Cache.attr_scans + 1
   local by = {}
   for _, set in ipairs(FindAllOf('BasicAttributeSet') or {}) do
@@ -1150,6 +1155,7 @@ local function DiscoverEnemies(pawn, enemies, now)
             or (faction ~= nil and faction:find('Enemy', 1, true) ~= nil)
         if hostile then
           Cache.faction_seen = Cache.faction_seen + 1
+          Cache.faction_reliable = true
           CollectEnemy(enemies, owner, class_name, px, py, pz, faction or '')
           local key = Address(owner)
           if key then known[key] = true end
@@ -1164,7 +1170,8 @@ local function DiscoverEnemies(pawn, enemies, now)
   -- actor scan only when that path found no usable enemy.
   Cache.actor_scan_count = 0
   Cache.actor_enemy_classes_seen = {}
-  if #enemies == 0 then
+  if #enemies == 0 and not Cache.faction_reliable and now >= (Cache.next_actor_fallback or 0) then
+    Cache.next_actor_fallback = now + 1.2
     local actors = Try(function() return FindAllOf('Character') end) or {}
     local actor_classes = {}
     for _, actor in ipairs(actors) do
@@ -1296,9 +1303,9 @@ end
 
 local function ObserveEnemyMontages(enemies, now)
   if now < Cache.next_montage_scan then return end
-  Cache.next_montage_scan = now + 0.08
+  Cache.next_montage_scan = now + 0.12
   local current, signatures = {}, Cache.montage_signatures or {}
-  for i = 1, math.min(#enemies, 4) do
+  for i = 1, math.min(#enemies, 3) do
     local enemy = enemies[i]
     local mesh = Try(function() return enemy.actor.Mesh end)
     local anim = Valid(mesh) and Try(function() return mesh:GetAnimInstance() end)
@@ -1310,6 +1317,7 @@ local function ObserveEnemyMontages(enemies, now)
       if name ~= '' and signatures[key] ~= name then
         signatures[key] = name
         RecordInput('montage:' .. name)
+        if Inj.IsAttackMontage(name) then Inj.PreGuard(enemy, now) end
       end
     end
   end
@@ -2249,6 +2257,7 @@ local function ResumeCombat(now)
   CombatYielded = false
   Counters.combat_resumes = Counters.combat_resumes + 1
   NextAttack = math.max(NextAttack, now + 0.08)
+  Cache.macro_next = math.max(Cache.macro_next or 0, now + 0.12)
   if reason == 'healing' then ComboReset(now, 'healing') end
   Combo.awaiting, Combo.ready = '', nil
   -- Defense pauses a sequence instead of restarting it at light one.  Without a
@@ -2347,7 +2356,7 @@ local function HealTick(now, hp, hp_max, can_start, enemies)
       if name:find('Boss', 1, true) or name:find('JingYe', 1, true) then boss = true end
     end
   end
-  local use_support = ratio <= 0.95 and ratio > 0.20
+  local use_support = Config.auto_items and ratio <= 0.95 and ratio > 0.20
       and now >= NextSupport and (boss or nearby >= 2) and HasRole('support_item')
   if not use_support and (ratio > Config.heal_threshold or now < NextHeal) then
     HealChainWait = nil
@@ -2521,7 +2530,7 @@ end
 Inj.CloseCombo = function(now)
   -- Never cancel medicine or defense when the user releases the combo key.
   ReleaseOffense(false)
-  Cache.macro_step, Cache.macro_next, Cache.macro_press_at = 0, 0, 0
+  Cache.macro_step, Cache.macro_next, Cache.macro_press_at, Cache.macro_tag = 0, 0, 0, ''
   ShadowPending = nil
   if Cache.combo_was_open then
     ComboReset(now, 'key-release')
@@ -2786,6 +2795,35 @@ Inj.MacroKeyRole = function(key)
   return 'attack_light', false
 end
 
+Inj.IsAttackMontage = function(name)
+  local upper = string.upper(name)
+  local ignore = { 'HIT', 'DIE', 'DEATH', 'REACT', 'BLOCK', 'PARRY', 'DODGE', 'IDLE', 'RUN', 'WALK', 'STUN' }
+  for _, word in ipairs(ignore) do
+    if string.find(upper, word, 1, true) then return false end
+  end
+  local attack = { 'SKILL', 'ATTACK', 'COMBO' }
+  for _, word in ipairs(attack) do
+    if string.find(upper, word, 1, true) then return true end
+  end
+  return false
+end
+
+-- A monster montage starting is the only warning before the deflect frame is
+-- published; block on that edge instead of waiting for a frame that is late
+-- most of the time.
+Inj.PreGuard = function(enemy, now)
+  if not HasRole('guard') then return end
+  -- Never trade a swing for a guard flick: only pre-block between our own attacks.
+  if now - (Cache.macro_press_at or 0) < Config.pre_guard_quiet then return end
+  if enemy.distance and enemy.distance > Config.pre_guard_distance then return end
+  if now < (Cache.pre_guard_until or 0) then return end
+  Cache.pre_guard_until = now + Config.pre_guard_interval
+  Counters.pre_guards = (Counters.pre_guards or 0) + 1
+  Status.pre_guards = tostring(Counters.pre_guards)
+  Status.pre_guard_class = enemy.class or ''
+  Press('guard', Config.pre_guard_hold)
+end
+
 Inj.MacroTick = function(now, pawn, target)
   if not (Config.attack_enabled and Config.combo_enabled) then return end
   if now - (Cache.macro_press_at or 0) < Config.press_gap then return end
@@ -2801,7 +2839,19 @@ Inj.MacroTick = function(now, pawn, target)
       return
     end
   end
-  if now < (Cache.macro_next or 0) then return end
+  -- The game publishes the move tag as soon as the previous swing connects;
+  -- treat a new tag as the go-ahead instead of guessing a fixed period.
+  local chain = ReadChain(now)
+  if chain ~= '' and chain ~= (Cache.macro_tag or '') then
+    Cache.macro_tag = chain
+    if now < (Cache.macro_next or 0) then Cache.macro_next = now + Config.press_gap end
+  end
+  if now < (Cache.macro_next or 0) then
+    -- Stall guard: if the string has not pressed anything for a while,
+    -- drop the cadence so the next tick fires immediately.
+    if now - (Cache.macro_press_at or 0) > 1.0 then Cache.macro_next = 0 end
+    return
+  end
   local weapon = Status.weapon or ''
   local family = weapon:gsub('^Weapon_', '')
   local pattern = Inj.WeaponPaths[family] or Inj.WeaponPaths.default
@@ -2812,11 +2862,12 @@ Inj.MacroTick = function(now, pawn, target)
   if role == 'attack_heavy' and not HeavyAffordable(AttrSet(pawn), false, 1) then
     key, role, charged = 'A', 'attack_light', false
   end
-  local hold = charged and Config.macro_hold or Config.press_hold
+  local hold = (charged or key == 'B') and math.max(Config.press_hold, 0.12) or Config.press_hold
   local ok = Press(role, hold)
   Cache.macro_step = step + 1
   Cache.macro_press_at = now
-  Cache.macro_next = now + math.max(0.20, Config.attack_period * 0.90)
+  Cache.macro_next = now + math.max(0.40, Config.attack_period)
+      + (key == 'B' and 0.14 or 0)
   Cache.macro_pattern = pattern
   Status.macro_pattern = pattern
   Status.macro_step = tostring(step + 1) .. '/' .. tostring(#pattern)

@@ -10,7 +10,7 @@ function Module.new(read_ini, path)
       self.next_read, self.held, self.state = 0, false, 'input_missing'
     end
     if now >= self.next_read then
-      self.next_read = now + 0.02
+      self.next_read = now + 0.05
       local packet = read_ini(path)
       local seq = packet and tonumber(packet.seq)
       local stamp = packet and tonumber(packet.stamp)
@@ -23,9 +23,9 @@ function Module.new(read_ini, path)
         self.held, self.state = false, 'input_missing'
       elseif seq > self.seq then
         self.seq, self.renewed = seq, now
-        self.held = packet.hold == '1' and packet.focused == '1'
-        self.state = packet.focused ~= '1' and 'background'
-            or self.held and 'held' or 'waiting_key'
+        self.held = packet.hold == '1'
+        self.state = self.held and (packet.focused == '1' and 'held' or 'held_background')
+            or packet.focused ~= '1' and 'background' or 'waiting_key'
       elseif seq < self.seq then
         self.held, self.state = false, 'input_expired'
       end

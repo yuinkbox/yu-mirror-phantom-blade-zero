@@ -699,7 +699,7 @@ class Sim:
             'dodge_enabled': '1', 'execution_enabled': '1', 'skills_enabled': '1',
             'shadow_enabled': '1', 'switch_enabled': '1', 'lock_enabled': '1',
             'heal_threshold': '0.4', 'attack_distance': '7', 'attack_period': '0.35',
-            'combo_preset': 'balanced',
+            'combo_preset': 'balanced', 'auto_items': '1', 'combo_macro': '0',
             'combat_mode': 'hold', 'combo_session': self.assist_session,
         }
         values.update({k: str(v) for k, v in settings.items()})

@@ -201,6 +201,7 @@ class ModBridge:
             "switch_enabled": _flag(settings, "switch_enabled", True),
             "combo_enabled": _flag(settings, "combo_enabled", True),
             "combo_macro": _flag(settings, "combo_macro", True),
+        "auto_items": _flag(settings, "auto_items", False),
             "heal_threshold": _number(settings, "threshold", 0.4),
             "attack_distance": _number(settings, "attack_distance", 3.5),
             "attack_period": _number(settings, "attack_period", 0.35),

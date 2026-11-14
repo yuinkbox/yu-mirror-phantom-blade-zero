@@ -11,7 +11,7 @@ from test_mod_bridge import install
 from test_mod_combat01710 import make_fight, presses, tmp_path
 
 
-@pytest.mark.parametrize('mode', ['released', 'missing', 'wrong_session', 'old_packet', 'background'])
+@pytest.mark.parametrize('mode', ['released', 'missing', 'wrong_session', 'old_packet'])
 def test_no_key_never_starts_any_offense_but_mod_runs(tmp_path, mode):
     sim, boss = make_fight(tmp_path)
     sim.actor.attributes._values.update(UltimateChargeCount=2, SpiritShadow=300)
@@ -21,13 +21,19 @@ def test_no_key_never_starts_any_offense_but_mod_runs(tmp_path, mode):
         sim.write_assist(hold=1, session='previous-desktop')
     elif mode == 'old_packet':
         sim.write_assist(hold=1, stamp=sim.now_epoch() - 10)
-    elif mode == 'background':
-        sim.write_assist(hold=1, focused=0)
     sim.step(count=180)
     assert not [x for x in sim.timed_injections if x[1] > 0], sim.read_status()
     assert sim.read_status()['running'] == '1'
     assert sim.read_status()['error'] == ''
 
+
+def test_background_focus_never_blocks_a_held_key(tmp_path):
+    """The panel is never the foreground window while the player is in game."""
+    sim, _ = make_fight(tmp_path)
+    sim.write_assist(hold=1, focused=0)
+    sim.step(count=90)
+    assert presses(sim), sim.read_status()
+    assert sim.read_status()['assist_hold'] == '1'
 
 def test_release_stops_followups_even_with_a_running_move_tag(tmp_path):
     sim, _ = make_fight(tmp_path)
